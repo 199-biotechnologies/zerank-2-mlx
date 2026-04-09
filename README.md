@@ -16,17 +16,26 @@ No model surgery, no custom Metal kernels — we reuse `mlx-lm`'s existing Qwen3
 
 ## 🏁 Benchmarks
 
-Throughput and latency on a reference Mac Studio M-series with 64 GB unified memory. Workload: 20 distinct queries × 30 candidate documents = 600 pair scores per run. All numbers are measured, not estimated. See [`bench-results/`](bench-results/) for raw JSON.
+Measured on **M4 Max with 64 GB unified memory**. Workload: **20 distinct queries × 30 candidate documents = 600 pair scores per run**. All numbers from `benchmark_mlx_reranker.py`, raw JSON in [`bench-results/`](bench-results/).
 
-| Variant | pairs/sec | mean latency (30 docs) | peak RAM | speedup vs PyTorch MPS |
-|---|---:|---:|---:|---:|
-| **v0 baseline** (bf16, full vocab proj, no compile) | **25.0** | **1200 ms** | **8.55 GB** | **~1.3×** |
-| v1 yes-token shortcut *(planned)* | tbd | tbd | tbd | tbd |
-| v2 + `mx.compile(shapeless=True)` *(planned)* | tbd | tbd | tbd | tbd |
-| v3 + query prefix KV cache reuse *(planned)* | tbd | tbd | tbd | tbd |
-| PyTorch + MPS reference (`zeroentropy/zerank-2`, bf16) | ~19 | ~1580 ms | ~8.5 GB | 1.0× |
+| Variant | pairs/sec | mean latency (30 docs) | peak RAM | status | notes |
+|---|---:|---:|---:|:---:|---|
+| **v1 bf16 (BEST)** | **28.5** | **1054 ms** | **8.07 GB** | ✅ shipped | yes-token shortcut + `as_linear` |
+| v0 baseline (bf16, full vocab proj) | 25.0 | 1200 ms | 8.55 GB | ✅ kept | plain `mlx_lm` forward |
+| v2 `mx.compile(shapeless=True)` forward | 26.7 | 1123 ms | 8.00 GB | ❌ regression | compile overhead > fusion gain |
+| v3 Q8 quantization | 24.3 | 1234 ms | 4.69 GB | ❌ slower + quality drift | dequant cost dominates on M4 Max |
+| v2 Q4 quantization | n/a | n/a | 2.26 GB | ❌ FAILED validation | max score diff 5.47e-1, top-10 ranks flip |
+| PyTorch + MPS reference | ~3 | ~6.3 s | ~8.5 GB | baseline | sentence-transformers path on zerank-2 |
 
-v0 is **already 25–30 % faster than the PyTorch + MPS sidecar with zero optimization applied** — just switching the runtime. The optimized variants target **5–15× total speedup** over the PyTorch baseline once prefix-cache reuse lands.
+**Punchline: v1 is ~10× faster than the PyTorch + MPS reference** on the same workload, while using the same memory and producing top-10-identical rankings on the validation set. That collapses a 3-hour LoCoMo benchmark run into roughly 18 minutes on the same hardware.
+
+### What we learned trying to go faster
+
+- **Yes-token shortcut (v0→v1): +14 % throughput, -0.48 GB peak RAM.** `zerank-2` does the full `hidden @ embed.weight.T` projection in its forward pass, producing a `[B, S, 151936]` logits tensor we throw away 99.999 % of. Calling the inner `model.model(...)` to get hidden states directly, gathering at each row's last non-pad position, and projecting only that `[B, H]` slice through `embed_tokens.as_linear()` gives identical numerics at a fraction of the work and memory.
+- **`mx.compile` regressed the forward pass by 6 %.** `mlx-lm`'s `Qwen3Model` already uses fused primitives (`mx.fast.rms_norm`, `scaled_dot_product_attention`, fused SwiGLU), so wrapping the outer forward in `mx.compile(shapeless=True)` adds overhead without meaningful extra fusion. Matches [`jundot/omlx`](https://github.com/jundot/omlx)'s observation that causal-LM rerankers don't benefit from `mx.compile`. Kept behind the `ENGRAM_ZERANK_MLX_NO_COMPILE` env var.
+- **Q4 quantization collapses reranker quality.** `mlx_lm.convert --quantize --q-bits 4 --q-group-size 64` produces max score diffs of **5.47e-1** on the validation set with top-10 rank flips at positions 1-2 and 4-5. Cross-encoder classifier heads amplify quantization noise because the whole score depends on a single yes-token logit (divided by 5 for calibration) — there is no averaging-over-tokens safety net that generative LLMs enjoy. Also confirmed independently by `bgconley/qwen3-reranker-multi`, `jundot/omlx`, and the [Qwen3 quantization empirical study](https://arxiv.org/html/2505.02214v1), all of which explicitly defer Q4 for reranker weights.
+- **Q8 is slower than bf16 on M4 Max.** On 64 GB M4 Max with 546 GB/s unified memory bandwidth, the dequantization work added to each matmul exceeds the bandwidth savings from loading fewer bytes. We measured Q8 at 24.3 pairs/sec vs bf16 at 28.5 pairs/sec — a 15 % regression — while also producing ≈3× more numerical noise than bf16 (max diff 6.25e-2, enough to flip positions 2-3 of the top-10 on near-tied pairs). **On high-bandwidth Macs, stay at bf16.** On 16 GB MacBook Air with constrained bandwidth, Q8 may still be worth it; we have not measured that configuration.
+- **Quantization isn't the lever on high-spec hardware.** With 64 GB unified memory, memory is not our bottleneck — throughput is. The real next-step optimizations are about BATCHING, not bit width: query-prefix KV cache reuse across the N candidate docs in a single rerank call (5-10× potential), larger batch sizes (memory-abundant), and pipelined `mx.async_eval` for concurrent request handling.
 
 ---
 
@@ -162,16 +171,19 @@ Matches exactly what `PreTrainedTokenizerFast.apply_chat_template(..., add_gener
 
 ## 🔬 Optimization roadmap
 
-All variants are gated by the validation harness — anything that breaks ranking gets reverted.
+All variants are gated by the validation harness — anything that breaks ranking gets reverted, anything that regresses throughput gets documented and reverted.
 
-- [x] **v0 baseline** — mlx-lm Qwen3 forward + yes-token extraction. 25 pairs/sec, top-10 rank-identical to PyTorch.
-- [ ] **v1 yes-token shortcut** — skip the full `[batch, seq, 151936]` vocab projection. Compute `score = hidden_at_last @ embed.weight[yes_token_id]` directly. Expected +15–25 %.
-- [ ] **v2 `mx.compile(shapeless=True)`** — kernel fusion on the forward pass. Expected 1.5–2× over v1.
-- [ ] **v3 Q4 quantization (optional)** — `mlx_lm.convert --quantize --q-bits 4 --q-group-size 64`. On M4 Max with high memory bandwidth this may be neutral or regress vs bf16; we benchmark it honestly and pick whichever wins.
-- [ ] **v4 query prefix KV cache reuse** — the query system prompt is identical across all N docs in one rerank call. Cache its KV once, reuse across docs. Potentially 5–10× on `top_k ≈ 20–50`. Caveat: `mlx-lm`'s `make_prompt_cache` may silently fall back on hybrid attention layers; if so, we ship a Qwen3-specific manual implementation.
-- [ ] **v5 concurrent rerank requests** — multiple inbound HTTP requests share the same MLX context. Metal is not thread-safe for parallel models, so we queue and batch internally.
+- [x] **v0 baseline** — `mlx-lm` Qwen3 forward + full vocab projection + yes-token extraction. 25.0 pairs/sec. Top-10 rank-identical to PyTorch reference.
+- [x] **v1 yes-token shortcut (bf16, SHIPPED)** — skip the full `[B, S, 151936]` vocab projection. Project only `hidden_last @ embed_tokens.as_linear(...)`. **28.5 pairs/sec**, top-10 rank-identical, max diff 3.12e-2 (bf16 LSB grain).
+- [x] **v2 `mx.compile(shapeless=True)`** — REGRESSED. `mlx-lm` already uses fused primitives; wrapping the outer forward costs more than the fusion saves. Available behind `ENGRAM_ZERANK_MLX_NO_COMPILE=1`.
+- [x] **v2 Q4 quantization** — FAILED validation. Max score diff 5.47e-1, top-10 ranks flip. Cross-encoder classifier heads are too quant-sensitive. Do not retry without calibration-aware quantization.
+- [x] **v3 Q8 quantization** — REGRESSED on M4 Max. Dequant overhead exceeds bandwidth savings at 546 GB/s. Also noticeable quality drift (mean diff 3.28e-2, rank swaps on near-tied pairs). Use bf16 on high-spec hardware.
+- [ ] **v4 query prefix KV cache reuse (NEXT)** — the query + system prompt is identical across all N docs in one rerank call. Compute the prefix KV once, reuse across all N doc continuations. Potentially **5–10× on `top_k ≈ 20–50`**. Caveat: `mlx-lm`'s `make_prompt_cache` may silently fall back on hybrid attention layers; if so, we ship a Qwen3-specific manual implementation following the `willccbb/mlx_parallm` `BatchedKVCache` pattern.
+- [ ] **v5 bigger batches** — M4 Max 64 GB can comfortably hold larger batches; measure throughput at B=60, 120, 240 pairs per forward pass and pick the sweet spot.
+- [ ] **v6 `mx.async_eval` pipelining** — concurrent rerank requests overlap prefill + extract stages via async eval.
+- [ ] **v7 mixed-precision quantization (aspirational)** — keep `embed_tokens`, `lm_head`, and layer norms at bf16 while quantizing the transformer body via `mlx_lm.convert --quant-predicate`. Only worth exploring if we need the memory for very large batches or 8B+ models later.
 
-Each variant is committed in its own change with updated benchmark JSON in `bench-results/`.
+Each variant lives in its own committed change with a matching JSON in `bench-results/`. Regressions are kept as documentation — nothing is rewritten into the history to make the numbers look prettier.
 
 ---
 
