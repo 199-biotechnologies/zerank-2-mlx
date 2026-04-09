@@ -1,71 +1,93 @@
+<div align="center">
+
+![zerank-2-mlx hero](assets/hero.png)
+
 # zerank-2-mlx
 
-**The fastest way to run [ZeroEntropy's zerank-2](https://huggingface.co/zeroentropy/zerank-2) cross-encoder reranker on Apple Silicon.**
+**The fastest way to run zerank-2, a 4B Qwen3-based cross-encoder reranker, on Apple Silicon.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![MLX](https://img.shields.io/badge/MLX-0.31%2B-orange.svg)](https://github.com/ml-explore/mlx)
-[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%20%7C%20M2%20%7C%20M3%20%7C%20M4-black.svg)](https://www.apple.com/mac/)
-[![GitHub stars](https://img.shields.io/github/stars/199-biotechnologies/zerank-2-mlx?style=social)](https://github.com/199-biotechnologies/zerank-2-mlx)
+<br />
 
-zerank-2 is a 4B Qwen3-based cross-encoder reranker that tops the [BEIR benchmark](https://www.zeroentropy.dev/articles/zerank-2-advanced-instruction-following-multilingual-reranker) for biomedical, legal, and STEM retrieval. This repo ports it to **[Apple's MLX framework](https://github.com/ml-explore/mlx)** so you can serve it from M-series Macs at high throughput without the PyTorch + MPS memory tax or the OOM crashes that plague the upstream Python sidecar.
+[![Star this repo](https://img.shields.io/github/stars/199-biotechnologies/zerank-2-mlx?style=for-the-badge&logo=github&label=%E2%AD%90%20Star%20this%20repo&color=yellow)](https://github.com/199-biotechnologies/zerank-2-mlx/stargazers)
+&nbsp;&nbsp;
+[![Follow @longevityboris](https://img.shields.io/badge/Follow_%40longevityboris-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/longevityboris)
 
-No model surgery, no custom Metal kernels — we reuse `mlx-lm`'s existing Qwen3 implementation and extract the calibrated yes-token logit directly. The result is a single-file HTTP sidecar and a small Python API that drop into any retrieval stack.
+<br />
 
----
-
-## 🏁 Benchmarks
-
-Measured on **M4 Max with 64 GB unified memory**. Workload: **20 distinct queries × 30 candidate documents = 600 pair scores per run**. All numbers from `benchmark_mlx_reranker.py`, raw JSON in [`bench-results/`](bench-results/).
-
-| Variant | pairs/sec | mean latency (30 docs) | peak RAM | status | notes |
-|---|---:|---:|---:|:---:|---|
-| **v1 bf16 (BEST)** | **28.5** | **1054 ms** | **8.07 GB** | ✅ shipped | yes-token shortcut + `as_linear` |
-| v0 baseline (bf16, full vocab proj) | 25.0 | 1200 ms | 8.55 GB | ✅ kept | plain `mlx_lm` forward |
-| v2 `mx.compile(shapeless=True)` forward | 26.7 | 1123 ms | 8.00 GB | ❌ regression | compile overhead > fusion gain |
-| v3 Q8 quantization | 24.3 | 1234 ms | 4.69 GB | ❌ slower + quality drift | dequant cost dominates on M4 Max |
-| v2 Q4 quantization | n/a | n/a | 2.26 GB | ❌ FAILED validation | max score diff 5.47e-1, top-10 ranks flip |
-| PyTorch + MPS reference | ~3 | ~6.3 s | ~8.5 GB | baseline | sentence-transformers path on zerank-2 |
-
-**Punchline: v1 is ~10× faster than the PyTorch + MPS reference** on the same workload, while using the same memory and producing top-10-identical rankings on the validation set. That collapses a 3-hour LoCoMo benchmark run into roughly 18 minutes on the same hardware.
-
-### What we learned trying to go faster
-
-- **Yes-token shortcut (v0→v1): +14 % throughput, -0.48 GB peak RAM.** `zerank-2` does the full `hidden @ embed.weight.T` projection in its forward pass, producing a `[B, S, 151936]` logits tensor we throw away 99.999 % of. Calling the inner `model.model(...)` to get hidden states directly, gathering at each row's last non-pad position, and projecting only that `[B, H]` slice through `embed_tokens.as_linear()` gives identical numerics at a fraction of the work and memory.
-- **`mx.compile` regressed the forward pass by 6 %.** `mlx-lm`'s `Qwen3Model` already uses fused primitives (`mx.fast.rms_norm`, `scaled_dot_product_attention`, fused SwiGLU), so wrapping the outer forward in `mx.compile(shapeless=True)` adds overhead without meaningful extra fusion. Matches [`jundot/omlx`](https://github.com/jundot/omlx)'s observation that causal-LM rerankers don't benefit from `mx.compile`. Kept behind the `ENGRAM_ZERANK_MLX_NO_COMPILE` env var.
-- **Q4 quantization collapses reranker quality.** `mlx_lm.convert --quantize --q-bits 4 --q-group-size 64` produces max score diffs of **5.47e-1** on the validation set with top-10 rank flips at positions 1-2 and 4-5. Cross-encoder classifier heads amplify quantization noise because the whole score depends on a single yes-token logit (divided by 5 for calibration) — there is no averaging-over-tokens safety net that generative LLMs enjoy. Also confirmed independently by `bgconley/qwen3-reranker-multi`, `jundot/omlx`, and the [Qwen3 quantization empirical study](https://arxiv.org/html/2505.02214v1), all of which explicitly defer Q4 for reranker weights.
-- **Q8 is slower than bf16 on M4 Max.** On 64 GB M4 Max with 546 GB/s unified memory bandwidth, the dequantization work added to each matmul exceeds the bandwidth savings from loading fewer bytes. We measured Q8 at 24.3 pairs/sec vs bf16 at 28.5 pairs/sec — a 15 % regression — while also producing ≈3× more numerical noise than bf16 (max diff 6.25e-2, enough to flip positions 2-3 of the top-10 on near-tied pairs). **On high-bandwidth Macs, stay at bf16.** On 16 GB MacBook Air with constrained bandwidth, Q8 may still be worth it; we have not measured that configuration.
-- **Quantization isn't the lever on high-spec hardware.** With 64 GB unified memory, memory is not our bottleneck — throughput is. The real next-step optimizations are about BATCHING, not bit width: query-prefix KV cache reuse across the N candidate docs in a single rerank call (5-10× potential), larger batch sizes (memory-abundant), and pipelined `mx.async_eval` for concurrent request handling.
+[![MIT License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
+&nbsp;
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg?style=for-the-badge)](https://www.python.org/downloads/)
+&nbsp;
+[![MLX 0.31+](https://img.shields.io/badge/MLX-0.31%2B-orange.svg?style=for-the-badge)](https://github.com/ml-explore/mlx)
+&nbsp;
+[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%E2%80%93M5-black.svg?style=for-the-badge&logo=apple)](https://www.apple.com/mac/)
 
 ---
 
-## ✨ Why this exists
+10× faster than the PyTorch + MPS reference. Same weights. Identical top-10 rankings. bf16, drop-in HTTP sidecar, 200-line Python port.
 
-If you run retrieval-augmented systems on Apple Silicon, you probably already want a strong local reranker. Your options today:
+[Install](#install) · [How it works](#how-it-works) · [Benchmarks](#benchmarks) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
-- **Cohere Rerank 3.5 / Voyage Rerank 2.5** — great quality but a network hop, latency you can't control, and per-token pricing.
-- **PyTorch + MPS upstream sidecar** — works, but `sentence-transformers` + custom `modeling_zeranker.py` is brittle: we hit two OOM events and a sidecar crash loop during a 1500-question benchmark that ate ~100 minutes of GPU time with zero partial results.
-- **llama.cpp + community GGUF** — the GGUF conversion of Qwen3 classifier heads has a [known bug](https://github.com/ggml-org/llama.cpp/issues/16407) that produces garbage scores (~4e-23). Not trustworthy yet.
-- **Ollama MLX backend (March 2026+)** — 57 % faster prefill, but Ollama [has no `/api/rerank`](https://github.com/ollama/ollama/issues/3368) and falls back to llama.cpp on Macs below 32 GB.
-
-**zerank-2-mlx** gives you a single purpose-built file that loads the official zerank-2 weights straight into MLX, serves the exact same HTTP contract as the PyTorch sidecar, and runs natively on Apple Silicon unified memory. No dependency sprawl, no custom kernels, no tokenizer trust-remote-code footgun.
+</div>
 
 ---
 
-## 🚀 Quick start
+## Why this exists
 
-### Install
+Every retrieval-augmented system needs a strong local reranker. On Apple Silicon the options are bad:
 
-You need a Mac with Apple Silicon (M1 / M2 / M3 / M4 / M5) and [`uv`](https://docs.astral.sh/uv/) for dependency management.
+- **ZeroEntropy's upstream Python sidecar** loads `zerank-2` through `sentence-transformers` + custom `modeling_zeranker.py` and runs on PyTorch + MPS. We ran it against a 1500-question LoCoMo benchmark. It OOM'd twice, crashed on a broken-pipe loop, and lost ~100 minutes of GPU time with no partial results.
+- **llama.cpp + community GGUF** has a [known bug](https://github.com/ggml-org/llama.cpp/issues/16407) that produces garbage scores (≈4e-23) for Qwen3 classifier heads. Not trustworthy.
+- **Ollama MLX backend** has no `/api/rerank` endpoint ([issue #3368](https://github.com/ollama/ollama/issues/3368)), and falls back to llama.cpp on Macs below 32 GB anyway.
+- **Cohere / Voyage rerank APIs** are strong but network-bound, per-token priced, and take your query data off-device.
+
+`zerank-2-mlx` is a single purpose-built file that loads the official zerank-2 weights straight into [Apple's MLX framework](https://github.com/ml-explore/mlx), serves the exact same HTTP contract as the PyTorch sidecar, and runs in bf16 on unified memory. No custom kernels. No dependency sprawl. No model surgery. No trust-remote-code tokenizer footgun.
+
+## Benchmarks
+
+![benchmark chart](assets/benchmark.png)
+
+<div align="center">
+
+Measured on **M4 Max, 64 GB unified memory**. Workload: 20 distinct queries × 30 candidate documents = 600 pair scores. Raw JSON in [`bench-results/`](bench-results/), reproducible with `benchmark_mlx_reranker.py`.
+
+</div>
+
+| Variant | pairs / sec | mean latency (30 docs) | peak RAM | status |
+|---|---:|---:|---:|:---:|
+| **v1 bf16 (shipped)** | **28.5** | **1054 ms** | **8.07 GB** | ✅ |
+| v0 baseline (full vocab proj) | 25.0 | 1200 ms | 8.55 GB | ✅ kept |
+| v2 `mx.compile` forward | 26.7 | 1123 ms | 8.00 GB | ❌ regression |
+| v3 Q8 quantization | 24.3 | 1234 ms | 4.69 GB | ❌ slower + drift |
+| v2 Q4 quantization | n/a | n/a | 2.26 GB | ❌ FAILED validation |
+| PyTorch + MPS reference | ~2.8 | ~6300 ms | ~8.5 GB | baseline |
+
+That's the kind of gap that turns a 3-hour LoCoMo benchmark run into an 18-minute one on the same laptop.
+
+## What we learned (and what surprised us)
+
+On a well-provisioned Mac, the usual "always quantize" advice is wrong. Here is what the optimisation sweep turned up.
+
+- **Yes-token shortcut is free. (v0 → v1, +14 % throughput, −0.48 GB peak.)** `zerank-2` projects hidden states through the full `embed_tokens.as_linear` to produce a `[B, S, 151936]` logits tensor, then throws 99.999 % of it away to read the yes-token column. Running the inner `model.model(...)` to get hidden states directly, gathering at the last non-pad position per row, and projecting only that `[B, H]` slice produces identical numerics at a fraction of the work. `as_linear` handles bf16 and quantized embeddings transparently.
+- **`mx.compile` regressed by 6 %.** `mlx-lm`'s Qwen3 already uses the fused primitives you want (`mx.fast.rms_norm`, `scaled_dot_product_attention`, fused SwiGLU). Wrapping the outer forward in `mx.compile(shapeless=True)` adds dispatch overhead without meaningful extra fusion. [`jundot/omlx`](https://github.com/jundot/omlx) sees the same thing for causal-LM rerankers. Kept behind `ENGRAM_ZERANK_MLX_NO_COMPILE` if you want to A/B test.
+- **Q4 killed reranker quality.** Max score diff 5.47e-1, top-10 ranks flip at positions 1-2 and 4-5. Cross-encoder classifier heads are dramatically more quant-sensitive than generation — the whole score depends on a single yes-token logit (divided by 5 for calibration), so there is no averaging safety net. This matches what [`bgconley/qwen3-reranker-multi`](https://github.com/bgconley/qwen3-reranker-multi), [`jundot/omlx`](https://github.com/jundot/omlx), and the [2025 Qwen3 quantization empirical study](https://arxiv.org/html/2505.02214v1) all found independently.
+- **Q8 was slower than bf16 on M4 Max.** 24.3 vs 28.5 pairs/sec. On 64 GB M4 Max with 546 GB/s unified memory bandwidth, the dequantization cost per matmul exceeds the bandwidth savings from loading fewer bytes. Q8 also showed ~3× more numerical noise than bf16 (max diff 6.25e-2), enough to flip positions 2-3 on near-tied pairs. Memory footprint halved (8.07 → 4.69 GB) but memory was never the constraint. On a 16 GB MacBook Air where bandwidth is lower, Q8 may flip this verdict — we have not measured that case.
+- **The real lever is batching, not bit-width.** The query is identical across all N candidate documents in a single rerank call. A proper query-prefix KV cache would let us reuse the prefix computation and get 5-10× more throughput on `top_k ≈ 20–50`. That is the next target, tracked in the [roadmap](#roadmap) below.
+
+## Install
+
+You need an Apple Silicon Mac (M1 through M5) and [`uv`](https://docs.astral.sh/uv/) for dependency resolution. Everything else is transitive.
 
 ```bash
 git clone https://github.com/199-biotechnologies/zerank-2-mlx.git
 cd zerank-2-mlx
 ```
 
-Everything runs under `uv`, so there is nothing to install globally.
+Nothing else. `uv` pulls `mlx`, `mlx-lm`, `transformers`, `safetensors`, and `huggingface_hub` the first time you invoke any of the scripts. The official [`zeroentropy/zerank-2`](https://huggingface.co/zeroentropy/zerank-2) weights download automatically from Hugging Face into your local cache on first run.
 
-### HTTP server (drop-in replacement for the PyTorch sidecar)
+## Quick start
+
+### HTTP server, drop-in replacement for the upstream sidecar
 
 ```bash
 uv run --with mlx --with 'mlx-lm>=0.21' --with 'transformers<5.0,>=4.45' \
@@ -73,11 +95,12 @@ uv run --with mlx --with 'mlx-lm>=0.21' --with 'transformers<5.0,>=4.45' \
        zerank_server_mlx.py
 ```
 
-The server exposes the same contract as ZeroEntropy's reference Python sidecar:
+The server exposes the same contract as the ZeroEntropy reference Python sidecar at `zerank_server.py`:
 
 ```bash
-# health
+# health check
 curl http://127.0.0.1:8766/health
+# -> {"status": "ok", "model": "zerank-2-mlx"}
 
 # rerank
 curl -X POST http://127.0.0.1:8766/rerank \
@@ -90,26 +113,27 @@ curl -X POST http://127.0.0.1:8766/rerank \
     ],
     "top_k": 2
   }'
+# -> {"results": [{"index": 0, "score": 3.25}, {"index": 1, "score": -1.48}], ...}
 ```
 
-Port defaults to `8766` so it does not collide with any legacy `8765` sidecar. Override with `ENGRAM_ZERANK_MLX_PORT=9000`.
+Port defaults to `8766` so it does not collide with any legacy sidecar on `8765`. Override with `ENGRAM_ZERANK_MLX_PORT=9000`.
 
 ### Python API
 
 ```python
 from zerank_server_mlx import load_model, score_pairs
 
-bundle = load_model()           # downloads and patches the HF snapshot once
+bundle = load_model()            # downloads weights once, caches locally
 scores = score_pairs(bundle, [
     ("What is the capital of France?", "Paris is the capital of France."),
     ("What is the capital of France?", "Berlin is the capital of Germany."),
 ])
-# → [3.25, -1.48]   (calibrated yes-token logit / 5, matches PyTorch reference within bf16 grain)
+# [3.25, -1.48]
 ```
 
-The returned scores match the official ZeroEntropy calibration: `yes_token_logit / 5`.
+Scores are the official ZeroEntropy calibration: `yes_token_logit / 5`.
 
-### Validate correctness against the PyTorch reference
+### Validate against the PyTorch reference
 
 ```bash
 uv run --with mlx --with 'mlx-lm>=0.21' --with 'transformers<5.0,>=4.45' \
@@ -117,25 +141,23 @@ uv run --with mlx --with 'mlx-lm>=0.21' --with 'transformers<5.0,>=4.45' \
        validate_mlx_reranker.py
 ```
 
-The validator loads both the PyTorch reference (`AutoModelForSequenceClassification` from ZeroEntropy's custom modeling code) and the MLX port, scores 20 diverse pairs on both, and asserts that the top-10 ranking is identical and the per-pair score diffs stay within the bf16 cross-runtime tolerance (5e-2 absolute, ≈ 2× bf16 LSB).
+Loads both runtimes, scores 20 diverse pairs on each, asserts top-10 rankings are identical and per-pair score drift stays within bf16 cross-runtime tolerance (5e-2 absolute, ≈ 2× bf16 LSB).
 
 ### Benchmark a new variant
 
 ```bash
 uv run --with mlx --with 'mlx-lm>=0.21' --with 'transformers<5.0,>=4.45' \
        --with safetensors --with huggingface_hub --with numpy \
-       benchmark_mlx_reranker.py --variant v0-baseline
+       benchmark_mlx_reranker.py --variant my-experiment
 ```
 
-Writes `bench-results/<variant>.json` with throughput, per-call latency percentiles, and peak RAM. See [`bench-results/`](bench-results/) for the committed baselines.
+Writes `bench-results/my-experiment.json` with throughput, mean and percentile latencies, peak RAM, commit SHA, and timestamp. Keep the JSONs committed so the history of what worked and what regressed lives in the repo.
 
----
-
-## 🧠 How it works
+## How it works
 
 ### zerank-2 is Qwen3 with a yes-token trick
 
-ZeroEntropy's [`modeling_zeranker.py`](https://huggingface.co/zeroentropy/zerank-2/blob/main/modeling_zeranker.py) inherits directly from `Qwen3PreTrainedModel` and `Qwen3Model`. There is no new classifier head — the `lm_head` is tied to `embed_tokens` (standard Qwen3), the model does a full forward pass, and scoring is just:
+ZeroEntropy's [`modeling_zeranker.py`](https://huggingface.co/zeroentropy/zerank-2/blob/main/modeling_zeranker.py) inherits from `Qwen3PreTrainedModel` and `Qwen3Model`. There is no new classifier head. `lm_head` is tied to `embed_tokens` (standard Qwen3), the model runs a full forward pass, and scoring is three lines:
 
 ```python
 last_pos = attention_mask.sum(dim=1) - 1
@@ -143,11 +165,11 @@ yes_logits = logits[batch_idx, last_pos, yes_token_id]
 score = yes_logits / 5.0
 ```
 
-where `yes_token_id = 9454`. The `/5` divisor is the calibration constant ZeroEntropy chose so scores live in a human-readable range.
+`yes_token_id = 9454`. The `/ 5` divisor is the calibration constant ZeroEntropy chose so scores live in a readable range.
 
-### The MLX port in one paragraph
+### The port in one paragraph
 
-We symlink the HuggingFace snapshot into a tempdir, patch `config.json`'s `model_type` from `zeroentropy` to `qwen3` (so `mlx-lm` recognises the architecture), swap `tokenizer_config.json` from the custom `ZeroEntropyTokenizer` to the stock `Qwen2TokenizerFast` (the custom class only overrides `__call__` to accept pair tuples — we inline the chat template ourselves), and call `mlx_lm.load()`. The resulting MLX `Model` already does the full vocab projection via `embed_tokens.as_linear(hidden_state)` because `tie_word_embeddings=True`. We then advanced-index the `[batch, last_pos, yes_token_id]` logit and divide by 5. **That is the entire port.**
+We symlink the Hugging Face snapshot into a tempdir, rewrite `config.json`'s `model_type` from `zeroentropy` to `qwen3` so `mlx-lm` takes the Qwen3 code path, swap `tokenizer_config.json` from the custom `ZeroEntropyTokenizer` to the stock `Qwen2TokenizerFast` (we inline the chat template ourselves so trust-remote-code is not needed), and call `mlx_lm.load()`. The resulting MLX `Model` already handles `tie_word_embeddings=True` via `embed_tokens.as_linear(hidden_state)`. We then gather the hidden state at each row's last non-pad position, project only that `[B, H]` slice, select the yes-token column, and divide by 5. That is the entire port.
 
 ### Why no explicit padding mask
 
@@ -167,78 +189,71 @@ Qwen3 is decoder-only with causal attention. With right padding (`padding_side="
 
 Matches exactly what `PreTrainedTokenizerFast.apply_chat_template(..., add_generation_prompt=True)` produces from zerank-2's `chat_template.jinja` in the no-tools case.
 
----
+## Roadmap
 
-## 🔬 Optimization roadmap
+Every variant is gated by the validation harness. Anything that breaks top-10 ranking gets reverted. Anything that regresses throughput gets documented as a negative result and reverted.
 
-All variants are gated by the validation harness — anything that breaks ranking gets reverted, anything that regresses throughput gets documented and reverted.
+- [x] **v0** — `mlx-lm` Qwen3 forward + full vocab projection + yes-token extraction. 25.0 pairs/sec. Top-10 rank-identical to PyTorch reference.
+- [x] **v1** — yes-token shortcut (bf16, SHIPPED). **28.5 pairs/sec**, top-10 rank-identical, max diff 3.12e-2.
+- [x] **v2** — `mx.compile(shapeless=True)` on the outer forward. REGRESSED. Behind `ENGRAM_ZERANK_MLX_NO_COMPILE=1`.
+- [x] **v2** — Q4 quantization. FAILED validation (max diff 5.47e-1).
+- [x] **v3** — Q8 quantization. REGRESSED on M4 Max (24.3 pairs/sec) plus measurable quality drift.
+- [ ] **v4** — query prefix KV cache reuse. Compute the query prefix KV once per rerank call, reuse across all N document continuations. Potentially 5-10× on `top_k ≈ 20–50`.
+- [ ] **v5** — larger batches. M4 Max 64 GB can comfortably batch 60-240 pairs per forward pass; measure and pick the sweet spot.
+- [ ] **v6** — `mx.async_eval` pipelining to overlap prefill and extract across inbound HTTP requests.
+- [ ] **v7** — mixed-precision quantization via `mlx_lm.convert --quant-predicate`: keep `embed_tokens`, `lm_head`, and layer norms at bf16 while quantizing the transformer body. Only worth exploring if we need the memory for 8B+ variants later.
 
-- [x] **v0 baseline** — `mlx-lm` Qwen3 forward + full vocab projection + yes-token extraction. 25.0 pairs/sec. Top-10 rank-identical to PyTorch reference.
-- [x] **v1 yes-token shortcut (bf16, SHIPPED)** — skip the full `[B, S, 151936]` vocab projection. Project only `hidden_last @ embed_tokens.as_linear(...)`. **28.5 pairs/sec**, top-10 rank-identical, max diff 3.12e-2 (bf16 LSB grain).
-- [x] **v2 `mx.compile(shapeless=True)`** — REGRESSED. `mlx-lm` already uses fused primitives; wrapping the outer forward costs more than the fusion saves. Available behind `ENGRAM_ZERANK_MLX_NO_COMPILE=1`.
-- [x] **v2 Q4 quantization** — FAILED validation. Max score diff 5.47e-1, top-10 ranks flip. Cross-encoder classifier heads are too quant-sensitive. Do not retry without calibration-aware quantization.
-- [x] **v3 Q8 quantization** — REGRESSED on M4 Max. Dequant overhead exceeds bandwidth savings at 546 GB/s. Also noticeable quality drift (mean diff 3.28e-2, rank swaps on near-tied pairs). Use bf16 on high-spec hardware.
-- [ ] **v4 query prefix KV cache reuse (NEXT)** — the query + system prompt is identical across all N docs in one rerank call. Compute the prefix KV once, reuse across all N doc continuations. Potentially **5–10× on `top_k ≈ 20–50`**. Caveat: `mlx-lm`'s `make_prompt_cache` may silently fall back on hybrid attention layers; if so, we ship a Qwen3-specific manual implementation following the `willccbb/mlx_parallm` `BatchedKVCache` pattern.
-- [ ] **v5 bigger batches** — M4 Max 64 GB can comfortably hold larger batches; measure throughput at B=60, 120, 240 pairs per forward pass and pick the sweet spot.
-- [ ] **v6 `mx.async_eval` pipelining** — concurrent rerank requests overlap prefill + extract stages via async eval.
-- [ ] **v7 mixed-precision quantization (aspirational)** — keep `embed_tokens`, `lm_head`, and layer norms at bf16 while quantizing the transformer body via `mlx_lm.convert --quant-predicate`. Only worth exploring if we need the memory for very large batches or 8B+ models later.
-
-Each variant lives in its own committed change with a matching JSON in `bench-results/`. Regressions are kept as documentation — nothing is rewritten into the history to make the numbers look prettier.
-
----
-
-## 📂 Repository layout
+## Repository layout
 
 ```
 zerank-2-mlx/
-├── zerank_server_mlx.py         # MLX HTTP sidecar, drop-in replacement for zerank_server.py
-├── validate_mlx_reranker.py     # Correctness gate vs the PyTorch reference
-├── benchmark_mlx_reranker.py    # Throughput / latency / memory benchmark harness
-├── bench-results/               # Committed benchmark JSON per variant (v0-baseline.json, ...)
-├── README.md                    # You are here
-└── LICENSE                      # MIT
+├── zerank_server_mlx.py          # MLX HTTP sidecar, drop-in for the PyTorch reference
+├── validate_mlx_reranker.py      # Correctness gate vs the PyTorch reference
+├── benchmark_mlx_reranker.py     # Throughput / latency / peak-RAM harness
+├── bench-results/                # Committed benchmark JSON per variant
+├── assets/                       # Hero + benchmark images used in this README
+├── README.md
+└── LICENSE                       # MIT (code). Weights remain CC-BY-NC 4.0.
 ```
 
----
+## Model licence
 
-## ⚠️ Model licence
+[ZeroEntropy's zerank-2 weights](https://huggingface.co/zeroentropy/zerank-2) are licensed under **CC-BY-NC 4.0** (non-commercial). This repository is MIT-licensed, but the model weights it loads are not, so check ZeroEntropy's terms before using this in a commercial product. For commercial use, talk to ZeroEntropy directly or use their hosted API.
 
-[ZeroEntropy's zerank-2 weights](https://huggingface.co/zeroentropy/zerank-2) are released under **CC-BY-NC 4.0** (non-commercial). This repository is MIT-licensed, but the model weights it loads are not, so **check ZeroEntropy's terms before using this in a commercial product**. For commercial use, contact ZeroEntropy directly or use their hosted API.
+The code in this repository (the MLX port, the validator, the benchmark harness, the image generators) is MIT-licensed and can be adapted to other models — Qwen3-Reranker, Jina Reranker v3, mxbai-rerank — without restriction.
 
-The code in this repository (the MLX port, the validator, the benchmark harness) is MIT-licensed and can be adapted to other models (Qwen3-Reranker, Jina Reranker v3, etc.) without restriction.
-
----
-
-## 🙏 Credits
-
-- **ZeroEntropy** for releasing [zerank-2](https://huggingface.co/zeroentropy/zerank-2) and the reference PyTorch modeling code.
-- **Apple MLX team** and the mlx-lm maintainers for the `Qwen3Model` implementation this port is built on.
-- **199 Biotechnologies** for sponsoring the engineering work inside [engram](https://github.com/199-biotechnologies/engram) (upcoming).
-
-Built because our long-running LoCoMo benchmark kept OOM-ing the PyTorch sidecar at question 1000-ish and we lost ~100 minutes of GPU time per run. Now it doesn't.
-
----
-
-## 🤝 Contributing
+## Contributing
 
 Optimization ideas, bug reports, and weird edge cases welcome. Before sending a PR:
 
-1. Run `validate_mlx_reranker.py` — it must pass (top-10 rank-identical to the PyTorch reference on the 20 test pairs).
-2. Run `benchmark_mlx_reranker.py --variant <your-change-name>` and commit the `bench-results/<variant>.json` alongside the code.
-3. Explain the change in the commit message: what it does, why, expected speedup, any risk.
+1. Run `validate_mlx_reranker.py`. It must pass (top-10 rank-identical to the PyTorch reference on the 20 test pairs).
+2. Run `benchmark_mlx_reranker.py --variant <your-change-name>` and commit the resulting JSON under `bench-results/` alongside the code.
+3. Explain the change in the commit message: what it does, why, expected speedup, any risk. Negative results are welcome — they prevent the next person from repeating the experiment.
 
-If you add a new optimization variant, please keep the baseline path reproducible so we can always revert.
+If you add a new optimization variant, keep the baseline path reproducible so we can always revert.
 
----
-
-## 📖 Related projects
+## Related projects
 
 - [zeroentropy/zerank-2](https://huggingface.co/zeroentropy/zerank-2) — the model card
 - [ml-explore/mlx](https://github.com/ml-explore/mlx) and [ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm)
 - [jina-ai/mlx-retrieval](https://github.com/jina-ai/mlx-retrieval) — reference Qwen2 cross-encoder implementation on MLX
-- [willccbb/mlx_parallm](https://github.com/willccbb/mlx_parallm) — `BatchedKVCache` pattern we plan to borrow in v5
-- [engram](https://github.com/199-biotechnologies/engram) — the 199 Biotechnologies memory engine this sidecar was built for
+- [willccbb/mlx_parallm](https://github.com/willccbb/mlx_parallm) — `BatchedKVCache` pattern we plan to borrow for v5
+- [bgconley/qwen3-reranker-multi](https://github.com/bgconley/qwen3-reranker-multi) — independent Qwen3-Reranker MLX service with the same compile-and-fall-back pattern
+- [jundot/omlx](https://github.com/jundot/omlx) — full MLX inference engine with reranker support
+- [engram](https://github.com/199-biotechnologies/engram) — the 199 Biotechnologies memory engine this sidecar was built for (coming soon)
 
 ---
 
-**Star the repo** ⭐ if this saved you from writing your own PyTorch → MLX port, and **open an issue** if your use case isn't covered yet.
+<div align="center">
+
+Built by [Boris Djordjevic](https://github.com/longevityboris) at [199 Biotechnologies](https://github.com/199-biotechnologies)
+
+<br />
+
+**If this saved you from writing your own PyTorch → MLX port:**
+
+[![Star this repo](https://img.shields.io/github/stars/199-biotechnologies/zerank-2-mlx?style=for-the-badge&logo=github&label=%E2%AD%90%20Star%20this%20repo&color=yellow)](https://github.com/199-biotechnologies/zerank-2-mlx/stargazers)
+&nbsp;&nbsp;
+[![Follow @longevityboris](https://img.shields.io/badge/Follow_%40longevityboris-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/longevityboris)
+
+</div>
